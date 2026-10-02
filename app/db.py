@@ -31,9 +31,21 @@ CREATE TABLE IF NOT EXISTS plans (
     request_json TEXT NOT NULL,
     result_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'proposed',  -- proposed / confirmed
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'plan',        -- plan：原始方案；revision：滚动重排草案
+    source_plan_id TEXT REFERENCES plans(id), -- revision 关联的原方案
+    revision_info TEXT,                       -- JSON：重排参数（已结束学期数等）
+    diff_json TEXT                            -- JSON：与原方案剩余学期的课程差异
 );
 """
+
+# 旧库增量升级用（新库已在 SCHEMA 中包含这些列）
+_PLAN_ADDED_COLUMNS = [
+    ("kind", "TEXT NOT NULL DEFAULT 'plan'"),
+    ("source_plan_id", "TEXT REFERENCES plans(id)"),
+    ("revision_info", "TEXT"),
+    ("diff_json", "TEXT"),
+]
 
 
 def db_path():
@@ -61,11 +73,15 @@ def _now():
 
 
 def init_db():
-    """建表；首次启动时写入种子目录（版本 1）。"""
+    """建表；首次启动时写入种子目录（版本 1）；旧库增量补齐重排草案列。"""
     directory = os.path.dirname(os.path.abspath(db_path()))
     os.makedirs(directory, exist_ok=True)
     with session() as conn:
         conn.executescript(SCHEMA)
+        existing = {r["name"] for r in conn.execute("PRAGMA table_info(plans)")}
+        for name, decl in _PLAN_ADDED_COLUMNS:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE plans ADD COLUMN {name} {decl}")
         n = conn.execute("SELECT COUNT(*) AS n FROM catalog_versions").fetchone()["n"]
         if n == 0:
             from .seed_data import SEED_COURSES
@@ -124,12 +140,34 @@ def insert_plan(conn, plan_id, version_id, request, result):
     )
 
 
+def insert_revision(conn, plan_id, version_id, request, result, source_id, revision_info, diff):
+    """保存滚动重排草案：关联原方案，携带重排参数与课程差异；状态恒为 proposed。"""
+    conn.execute(
+        "INSERT INTO plans (id, version_id, request_json, result_json, status, created_at,"
+        " kind, source_plan_id, revision_info, diff_json)"
+        " VALUES (?,?,?,?,?,?, 'revision', ?,?,?)",
+        (plan_id, version_id, json.dumps(request, ensure_ascii=False),
+         json.dumps(result, ensure_ascii=False), "proposed", _now(),
+         source_id, json.dumps(revision_info, ensure_ascii=False),
+         json.dumps(diff, ensure_ascii=False)),
+    )
+
+
 def get_plan(conn, plan_id):
     return conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
 
 
 def list_plans(conn):
-    return conn.execute("SELECT * FROM plans ORDER BY created_at DESC, id DESC").fetchall()
+    """原始方案（不含滚动重排草案；草案通过 list_revisions 查询）。"""
+    return conn.execute(
+        "SELECT * FROM plans WHERE kind='plan' ORDER BY created_at DESC, id DESC").fetchall()
+
+
+def list_revisions(conn, source_id):
+    """某原方案关联保存的全部滚动重排草案（按创建先后；同秒以自增 rowid 破平）。"""
+    return conn.execute(
+        "SELECT * FROM plans WHERE kind='revision' AND source_plan_id=?"
+        " ORDER BY rowid", (source_id,)).fetchall()
 
 
 def set_plan_status(conn, plan_id, status):

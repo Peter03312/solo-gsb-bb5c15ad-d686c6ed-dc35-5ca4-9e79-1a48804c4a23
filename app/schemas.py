@@ -74,3 +74,18 @@ class PlanIn(BaseModel):
         if info.field_name == "target_courses" and not codes:
             raise ValueError("目标课程不能为空")
         return codes
+
+
+class RevisionIn(BaseModel):
+    """已确认方案执行中途的滚动重排请求。"""
+
+    finished_semesters: int = Field(
+        gt=0, description="已结束学期数，必须大于零；且须小于原规划学期数")
+    completed_courses: list[str] = Field(
+        default_factory=list,
+        description="截至该时点的累计已修课程；须覆盖原方案创建时声明的已修课程，不得撤销")
+
+    @field_validator("completed_courses")
+    @classmethod
+    def norm_codes(cls, v):
+        return sorted({_norm_code(x) for x in v if x.strip()})
