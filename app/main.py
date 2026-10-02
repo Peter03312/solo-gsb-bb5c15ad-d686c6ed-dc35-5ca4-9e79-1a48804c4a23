@@ -1,0 +1,204 @@
+"""高校课程学期规划服务 —— FastAPI 入口。"""
+from __future__ import annotations
+
+import json
+import uuid
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from . import db
+from .planner import Course, PlanError, build_plan
+from .schemas import CatalogIn, PlanIn
+
+
+@asynccontextmanager
+async def lifespan(_):
+    db.init_db()  # 建表；首次启动写入种子目录（版本 1）
+    yield
+
+
+app = FastAPI(
+    title="高校课程学期规划服务",
+    version="1.0.0",
+    description="基于课程目录版本的学期排课规划：先修组、同修、开课季节、学分上限约束下的最早完成方案。",
+    lifespan=lifespan,
+)
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_input_handler(_, exc):
+    errors = [
+        {"loc": list(e.get("loc", [])), "msg": e.get("msg", ""), "type": e.get("type", "")}
+        for e in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=422,
+        content={"detail": {"code": "INVALID_INPUT", "message": "非法输入", "errors": errors}},
+    )
+
+
+def _to_catalog(rows):
+    return {
+        r["code"]: Course(
+            code=r["code"], name=r["name"], credits=r["credits"],
+            seasons=frozenset(r["semesters"]),
+            prereq_groups=tuple(tuple(g) for g in r["prereq_groups"]),
+            coreqs=tuple(r["coreqs"]),
+        )
+        for r in rows
+    }
+
+
+def _plan_out(row):
+    return {
+        "plan_id": row["id"],
+        "status": row["status"],
+        "catalog_version": row["version_id"],
+        "request": json.loads(row["request_json"]),
+        "result": json.loads(row["result_json"]),
+        "created_at": row["created_at"],
+    }
+
+
+# ---------------------------------------------------------------- 基础
+
+@app.get("/")
+def root():
+    return {"service": "高校课程学期规划服务", "docs": "/docs", "health": "/health"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------- 课程目录
+
+@app.post("/catalog/versions", status_code=201)
+def create_catalog(payload: CatalogIn):
+    """目录修订：全量提交课程集合，生成新版本并成为当前版本。"""
+    courses = [
+        {
+            "code": c.code, "name": c.name, "credits": c.credits,
+            "semesters": c.semesters, "prereq_groups": c.prereq_groups, "coreqs": c.coreqs,
+        }
+        for c in payload.courses
+    ]
+    with db.session() as conn:
+        vid = db.create_catalog_version(conn, payload.note, courses)
+        version = db.get_version(conn, vid)
+    return {
+        "version_id": vid,
+        "note": version["note"],
+        "course_count": len(courses),
+        "created_at": version["created_at"],
+    }
+
+
+@app.get("/catalog/current")
+def current_catalog():
+    with db.session() as conn:
+        version = db.get_current_version(conn)
+        courses = db.load_courses(conn, version["id"])
+    return {
+        "version_id": version["id"],
+        "note": version["note"],
+        "created_at": version["created_at"],
+        "courses": courses,
+    }
+
+
+@app.get("/catalog/versions/{version_id}")
+def catalog_version(version_id: int):
+    """查看历史目录版本（供回看方案所绑定的目录）。"""
+    with db.session() as conn:
+        version = db.get_version(conn, version_id)
+        if version is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND", "message": f"目录版本 {version_id} 不存在"})
+        courses = db.load_courses(conn, version_id)
+    return {
+        "version_id": version["id"],
+        "note": version["note"],
+        "created_at": version["created_at"],
+        "courses": courses,
+    }
+
+
+# ---------------------------------------------------------------- 规划方案
+
+@app.post("/plans", status_code=201)
+def create_plan(payload: PlanIn):
+    """生成规划方案并绑定当前目录版本；失败时说明原因，不返回部分课表。"""
+    with db.session() as conn:
+        version = db.get_current_version(conn)
+        catalog = _to_catalog(db.load_courses(conn, version["id"]))
+        try:
+            result = build_plan(
+                catalog,
+                completed=set(payload.completed_courses),
+                targets=payload.target_courses,
+                start_semester=payload.start_semester,
+                max_credits=payload.max_credits_per_semester,
+                num_semesters=payload.num_semesters,
+            )
+        except PlanError as exc:
+            status = 400 if exc.code == "INVALID_INPUT" else 422
+            raise HTTPException(status_code=status,
+                                detail={"code": exc.code, "message": exc.message})
+        plan_id = uuid.uuid4().hex[:12]
+        db.insert_plan(conn, plan_id, version["id"], payload.model_dump(), result)
+        row = db.get_plan(conn, plan_id)
+    return _plan_out(row)
+
+
+@app.get("/plans")
+def list_plans():
+    with db.session() as conn:
+        rows = db.list_plans(conn)
+    return [
+        {
+            "plan_id": r["id"],
+            "status": r["status"],
+            "catalog_version": r["version_id"],
+            "completion_semester": json.loads(r["result_json"]).get("completion_semester"),
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
+@app.get("/plans/{plan_id}")
+def get_plan(plan_id: str):
+    """回看方案（含其绑定的目录版本号）。"""
+    with db.session() as conn:
+        row = db.get_plan(conn, plan_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND", "message": f"方案 {plan_id} 不存在"})
+    return _plan_out(row)
+
+
+@app.post("/plans/{plan_id}/confirm")
+def confirm_plan(plan_id: str):
+    """确认方案：若目录自规划后已修订，则拒绝且不写入。"""
+    with db.session() as conn:
+        row = db.get_plan(conn, plan_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND", "message": f"方案 {plan_id} 不存在"})
+        if row["status"] == "confirmed":
+            return _plan_out(row)  # 幂等：已确认的方案直接返回
+        current = db.get_current_version(conn)
+        if row["version_id"] != current["id"]:
+            raise HTTPException(status_code=409, detail={
+                "code": "CATALOG_CHANGED",
+                "message": f"目录已修订（当前版本 {current['id']}，方案基于版本 "
+                           f"{row['version_id']}），确认被拒绝，请重新规划",
+            })
+        db.set_plan_status(conn, plan_id, "confirmed")
+        row = db.get_plan(conn, plan_id)
+    return _plan_out(row)
