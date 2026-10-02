@@ -19,6 +19,17 @@
     返回具体原因，**不返回部分课表**。
 - **目录版本**：每次目录修订生成新版本；方案创建时绑定当前版本，可随时回看；
   确认方案时若目录已修订，则拒绝（409）且不写入。
+- **执行中途滚动重排（草案）**：已确认方案执行过程中，如实际完成情况与计划不同或目录已修订，
+  可凭**原方案编号、已结束学期数、截至该时点的累计已修课程**重新排课：
+  - 已结束学期数必须 **大于 0 且小于原规划期限**；累计已修**不得撤销**原方案创建时声明的已修
+    （必须是其超集，可包含计划外提前修完的课程）。
+  - 从原起始学期顺延至下一学期起，沿用**原目标课程、原每学期学分上限和剩余学期数**，
+    按**当前目录**求最早完成的完整未来课表；已修课程不重复排入。
+  - 返回新课表以及与**原方案剩余学期**（跳过已结束学期）的课程差异（逐学期新增/移除 + 汇总），
+    并作为**待确认草案**（`status="draft"`）关联原方案保存；原方案及其历史目录保持不变。
+  - 草案沿用既有确认约定：`POST /plans/{draft_id}/confirm`，目录在草案生成后再修订则 409 拒绝。
+  - 原方案不存在或未确认、目标缺失、条件冲突、期限内无解、撤销原已修或学期数越界时，
+    返回具体原因且**不保存**；目录在计算至落库之间被修订时，拒绝旧版本结果（409，不保存）。
 
 ## 快速开始
 
@@ -65,7 +76,8 @@ Compose 通过命名卷 `planner-data` 持久化数据。
 | POST | `/plans` | 生成规划方案（绑定当前目录版本） |
 | GET | `/plans` | 方案列表 |
 | GET | `/plans/{id}` | 回看方案（含绑定的目录版本号） |
-| POST | `/plans/{id}/confirm` | 确认方案；目录已修订则 409 拒绝且不写入 |
+| POST | `/plans/{id}/confirm` | 确认方案/草案；目录已修订则 409 拒绝且不写入 |
+| POST | `/plans/{id}/replan` | 已确认方案执行中途滚动重排，生成关联草案（201） |
 
 ### 目录课程字段
 
@@ -134,6 +146,65 @@ curl http://localhost:8000/catalog/versions/1                    # 回看历史�
 bash examples/demo.sh
 ```
 
+### 执行中途滚动重排
+
+仅可对**已确认**方案发起；重排结果以**草案**形式关联保存，原方案不变。
+请求只需原方案编号、已结束学期数与累计已修课程（目标、学分上限、起始学期均取自原方案，
+期限取剩余学期数，目录取当前版本）：
+
+```bash
+curl -X POST http://localhost:8000/plans/<plan_id>/replan \
+  -H 'Content-Type: application/json' -d '{
+    "elapsed_semesters": 2,
+    "completed_courses": ["CS101", "CS101L", "CS201", "MATH103", "CS301"]
+  }'
+```
+
+响应（201，节选）：
+
+```json
+{
+  "plan_id": "a1b2c3d4e5f6",
+  "status": "draft",
+  "catalog_version": 2,
+  "source_plan_id": "64adff786f4c",
+  "request": {
+    "completed_courses": ["CS101", "CS101L", "CS201", "CS301", "MATH103"],
+    "target_courses": ["CS401"],
+    "start_semester": "2027-SPRING",
+    "max_credits_per_semester": 12,
+    "num_semesters": 4
+  },
+  "result": {
+    "completion_semester": "2027-FALL",
+    "total_credits": 7,
+    "semesters": [
+      {"semester": "2027-SPRING", "courses": [], "total_credits": 0},
+      {"semester": "2027-FALL", "courses": [{"code": "CS401", "credits": 4}], "total_credits": 4}
+    ]
+  },
+  "replan": {
+    "source_plan_id": "64adff786f4c",
+    "elapsed_semesters": 2,
+    "completed_courses": ["CS101", "CS101L", "CS201", "CS301", "MATH103"],
+    "difference": {
+      "semesters": [
+        {"semester": "2027-SPRING", "added_courses": [], "removed_courses": ["CS301"]},
+        {"semester": "2027-FALL", "added_courses": [], "removed_courses": []}
+      ],
+      "added_courses": [],
+      "removed_courses": ["CS301"]
+    }
+  }
+}
+```
+
+- `request`：本次未来课表的有效规划输入（起始学期已顺延、学期数为剩余数）。
+- `replan.difference`：新课表与**原方案剩余学期**（原课表跳过前 2 个已结束学期后按学期对齐）
+  的逐学期差异；`added_courses`/`removed_courses` 为跨学期去重汇总。
+- 确认草案沿用原约定：`POST /plans/<draft_id>/confirm`；`GET /plans` 列表中草案带
+  `source_plan_id` 字段。确认草案不影响原方案。
+
 ### 错误响应
 
 失败时返回相应 HTTP 状态码与原因，不返回部分课表：
@@ -149,7 +220,9 @@ bash examples/demo.sh
 | `REQUIREMENT_CONFLICT` | 422 | 条件冲突：先修循环、同修课无共同开课学期、同修课不在目录等 |
 | `NO_SOLUTION` | 422 | 无解：期限内无法排完（学分上限/开课季节/先修顺序限制） |
 | `TOO_COMPLEX` | 422 | 组合或搜索超出内置复杂度上限 |
-| `CATALOG_CHANGED` | 409 | 确认时目录已修订，拒绝且不写入 |
+| `CATALOG_CHANGED` | 409 | 确认（或重排落库）时目录已修订，拒绝且不写入 |
+| `PLAN_NOT_CONFIRMED` | 409 | 对未确认方案发起滚动重排 |
+| `COMPLETED_REVOKED` | 422 | 累计已修撤销了原方案创建时声明的已修课程 |
 | `NOT_FOUND` | 404 | 方案或目录版本不存在 |
 
 ## 项目结构
@@ -158,8 +231,9 @@ bash examples/demo.sh
 app/
   main.py       # FastAPI 路由与错误处理
   planner.py    # 规划引擎（先修组枚举、同修合并、回溯排课、字典序选优）
+  replan.py     # 执行中途滚动重排（学期顺延、剩余学期课程差异）
   schemas.py    # 请求模型与校验
-  db.py         # SQLite 持久化（目录版本、方案）
+  db.py         # SQLite 持久化（目录版本、方案、重排草案）
   seed_data.py  # 种子课程目录（版本 1）
 tests/          # pytest 单元与 API 集成测试
 examples/       # demo.sh 调用示例、catalog_v2.json 目录修订示例

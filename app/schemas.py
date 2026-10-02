@@ -74,3 +74,28 @@ class PlanIn(BaseModel):
         if info.field_name == "target_courses" and not codes:
             raise ValueError("目标课程不能为空")
         return codes
+
+
+class ReplanIn(BaseModel):
+    """方案执行中途的滚动重排输入。
+
+    - elapsed_semesters：已结束学期数，须大于 0 且小于原规划期限；
+    - completed_courses：截至该时点的累计已修课程，
+      不得撤销原方案创建时声明的已修课程（须为其超集）。
+    """
+
+    elapsed_semesters: int = Field(description="已结束学期数（0 < x < 原规划学期数）")
+    completed_courses: list[str] = Field(
+        default_factory=list, description="截至该时点的累计已修课程（须包含原方案声明的已修）")
+
+    @field_validator("elapsed_semesters")
+    @classmethod
+    def elapsed_positive(cls, v):
+        if v <= 0:
+            raise ValueError("已结束学期数必须大于 0")
+        return v
+
+    @field_validator("completed_courses")
+    @classmethod
+    def norm_codes(cls, v):
+        return sorted({_norm_code(x) for x in v if x.strip()})

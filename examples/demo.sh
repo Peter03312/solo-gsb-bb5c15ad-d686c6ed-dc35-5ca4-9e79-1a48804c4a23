@@ -61,25 +61,62 @@ curl -s -X POST "$BASE/plans/$PLAN_C_ID/confirm"; echo
 step "9. 回看：方案绑定的目录版本"
 curl -s "$BASE/catalog/versions/1"; echo
 
-step "10. 错误示例：课程缺失"
+step "10. 滚动重排：方案 A 执行 3 个学期后，凭原编号/已结束学期数/累计已修按当前目录(v2)重排"
+REPLAN_D=$(curl -s -X POST "$BASE/plans/$PLAN_A_ID/replan" -H 'Content-Type: application/json' -d '{
+  "elapsed_semesters": 3,
+  "completed_courses": ["CS101", "CS101L", "CS201", "MATH103", "CS301"]
+}')
+echo "$REPLAN_D"
+DRAFT_D_ID=$(echo "$REPLAN_D" | python3 -c "import sys,json;print(json.load(sys.stdin)['plan_id'])")
+
+step "11. 重排差异演示：仅执行 2 个学期，但额外提前修完 CS301（原方案第 3 学期课程）"
+curl -s -X POST "$BASE/plans/$PLAN_A_ID/replan" -H 'Content-Type: application/json' -d '{
+  "elapsed_semesters": 2,
+  "completed_courses": ["CS101", "CS101L", "CS201", "MATH103", "CS301"]
+}'; echo
+
+step "12. 确认重排草案 D（基于当前目录 v2，应成功；不影响原方案 A）"
+curl -s -X POST "$BASE/plans/$DRAFT_D_ID/confirm"; echo
+echo "原方案 A 仍为 confirmed 且绑定 v1："
+curl -s "$BASE/plans/$PLAN_A_ID"; echo
+
+step "13. 错误示例：对未确认方案 B 重排（应 409 PLAN_NOT_CONFIRMED，不保存草案）"
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/plans/$PLAN_B_ID/replan" \
+  -H 'Content-Type: application/json' -d '{"elapsed_semesters": 1, "completed_courses": []}'
+
+step "14. 错误示例：已结束学期数越界（0 / 达到原期限 6）"
+curl -s -X POST "$BASE/plans/$PLAN_A_ID/replan" -H 'Content-Type: application/json' \
+  -d '{"elapsed_semesters": 0, "completed_courses": []}'; echo
+curl -s -X POST "$BASE/plans/$PLAN_A_ID/replan" -H 'Content-Type: application/json' \
+  -d '{"elapsed_semesters": 6, "completed_courses": []}'; echo
+
+step "15. 错误示例：累计已修撤销了原方案声明的已修课程（422 COMPLETED_REVOKED）"
+curl -s -X POST "$BASE/plans/$PLAN_C_ID/replan" -H 'Content-Type: application/json' \
+  -d '{"elapsed_semesters": 1, "completed_courses": ["CS101"]}'; echo
+
+step "16. 错误示例：剩余学期内无解（422 NO_SOLUTION，不保存草案）"
+curl -s -X POST "$BASE/plans/$PLAN_A_ID/replan" -H 'Content-Type: application/json' \
+  -d '{"elapsed_semesters": 5, "completed_courses": ["CS101", "CS101L"]}'; echo
+
+step "17. 错误示例：课程缺失"
 curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
   "target_courses": ["ABC123"], "start_semester": "2026-SPRING",
   "max_credits_per_semester": 12, "num_semesters": 6
 }'; echo
 
-step "11. 错误示例：条件冲突（CS999 与其同修课开课季节互斥）"
+step "18. 错误示例：条件冲突（CS999 与其同修课开课季节互斥）"
 curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
   "target_courses": ["CS999"], "start_semester": "2026-SPRING",
   "max_credits_per_semester": 12, "num_semesters": 6
 }'; echo
 
-step "12. 错误示例：期限内无解"
+step "19. 错误示例：期限内无解"
 curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
   "target_courses": ["CS401"], "start_semester": "2026-SPRING",
   "max_credits_per_semester": 12, "num_semesters": 2
 }'; echo
 
-step "13. 错误示例：非法输入（空目标 / 非正上限）"
+step "20. 错误示例：非法输入（空目标 / 非正上限）"
 curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
   "target_courses": [], "start_semester": "2026-SPRING",
   "max_credits_per_semester": 12, "num_semesters": 6

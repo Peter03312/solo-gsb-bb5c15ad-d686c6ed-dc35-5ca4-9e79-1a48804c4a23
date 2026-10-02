@@ -11,7 +11,8 @@ from fastapi.responses import JSONResponse
 
 from . import db
 from .planner import Course, PlanError, build_plan
-from .schemas import CatalogIn, PlanIn
+from .replan import replan_plan
+from .schemas import CatalogIn, PlanIn, ReplanIn
 
 
 @asynccontextmanager
@@ -53,7 +54,7 @@ def _to_catalog(rows):
 
 
 def _plan_out(row):
-    return {
+    out = {
         "plan_id": row["id"],
         "status": row["status"],
         "catalog_version": row["version_id"],
@@ -61,6 +62,11 @@ def _plan_out(row):
         "result": json.loads(row["result_json"]),
         "created_at": row["created_at"],
     }
+    source = row["source_plan_id"] if "source_plan_id" in row.keys() else None
+    if source:
+        out["source_plan_id"] = source
+        out["replan"] = json.loads(row["replan_json"])
+    return out
 
 
 # ---------------------------------------------------------------- 基础
@@ -159,16 +165,19 @@ def create_plan(payload: PlanIn):
 def list_plans():
     with db.session() as conn:
         rows = db.list_plans(conn)
-    return [
-        {
+    out = []
+    for r in rows:
+        item = {
             "plan_id": r["id"],
             "status": r["status"],
             "catalog_version": r["version_id"],
             "completion_semester": json.loads(r["result_json"]).get("completion_semester"),
             "created_at": r["created_at"],
         }
-        for r in rows
-    ]
+        if r["source_plan_id"]:
+            item["source_plan_id"] = r["source_plan_id"]
+        out.append(item)
+    return out
 
 
 @app.get("/plans/{plan_id}")
@@ -184,7 +193,7 @@ def get_plan(plan_id: str):
 
 @app.post("/plans/{plan_id}/confirm")
 def confirm_plan(plan_id: str):
-    """确认方案：若目录自规划后已修订，则拒绝且不写入。"""
+    """确认方案或重排草案：若目录自其生成后已修订，则拒绝且不写入。"""
     with db.session() as conn:
         row = db.get_plan(conn, plan_id)
         if row is None:
@@ -202,3 +211,61 @@ def confirm_plan(plan_id: str):
         db.set_plan_status(conn, plan_id, "confirmed")
         row = db.get_plan(conn, plan_id)
     return _plan_out(row)
+
+
+@app.post("/plans/{plan_id}/replan", status_code=201)
+def replan_plan_route(plan_id: str, payload: ReplanIn):
+    """已确认方案执行中途，凭已结束学期数与累计已修课程按当前目录滚动重排。
+
+    结果作为关联原方案的待确认草案（status=draft）保存；原方案及其历史目录不变。
+    目录在计算至落库间被修订时，拒绝旧版本结果（409）且不保存。
+    """
+    with db.session() as conn:
+        row = db.get_plan(conn, plan_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND", "message": f"方案 {plan_id} 不存在"})
+        if row["status"] != "confirmed":
+            raise HTTPException(status_code=409, detail={
+                "code": "PLAN_NOT_CONFIRMED",
+                "message": f"方案 {plan_id} 状态为 {row['status']}，仅已确认方案可滚动重排",
+            })
+
+        original_request = json.loads(row["request_json"])
+        original_result = json.loads(row["result_json"])
+
+        version = db.get_current_version(conn)
+        catalog = _to_catalog(db.load_courses(conn, version["id"]))
+        try:
+            effective_request, result, diff = replan_plan(
+                catalog,
+                original_request=original_request,
+                original_result=original_result,
+                elapsed_semesters=payload.elapsed_semesters,
+                completed=set(payload.completed_courses),
+            )
+        except PlanError as exc:
+            status = 400 if exc.code == "INVALID_INPUT" else 422
+            raise HTTPException(status_code=status,
+                                detail={"code": exc.code, "message": exc.message})
+
+        # 落库前复查：目录在计算期间被修订则拒绝旧版本结果，不保存
+        current = db.get_current_version(conn)
+        if current["id"] != version["id"]:
+            raise HTTPException(status_code=409, detail={
+                "code": "CATALOG_CHANGED",
+                "message": f"目录在重排期间已修订（计算基于版本 {version['id']}，"
+                           f"当前版本 {current['id']}），旧版本结果被拒绝，请重新发起重排",
+            })
+
+        draft_id = uuid.uuid4().hex[:12]
+        replan_meta = {
+            "source_plan_id": plan_id,
+            "elapsed_semesters": payload.elapsed_semesters,
+            "completed_courses": payload.completed_courses,
+            "difference": diff,
+        }
+        db.insert_draft(conn, draft_id, version["id"], effective_request, result,
+                        source_plan_id=plan_id, replan=replan_meta)
+        draft = db.get_plan(conn, draft_id)
+    return _plan_out(draft)

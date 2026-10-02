@@ -30,10 +30,18 @@ CREATE TABLE IF NOT EXISTS plans (
     version_id INTEGER NOT NULL REFERENCES catalog_versions(id),
     request_json TEXT NOT NULL,
     result_json TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'proposed',  -- proposed / confirmed
-    created_at TEXT NOT NULL
+    status TEXT NOT NULL DEFAULT 'proposed',  -- proposed / confirmed / draft
+    created_at TEXT NOT NULL,
+    source_plan_id TEXT REFERENCES plans(id), -- 滚动重排草案关联的原方案；非草案为 NULL
+    replan_json TEXT                          -- 草案的重排上下文与差异；非草案为 NULL
 );
 """
+
+# 既有数据库增量升级（SQLite 不支持 CREATE TABLE IF NOT EXISTS 加列）
+MIGRATIONS = (
+    "ALTER TABLE plans ADD COLUMN source_plan_id TEXT REFERENCES plans(id)",
+    "ALTER TABLE plans ADD COLUMN replan_json TEXT",
+)
 
 
 def db_path():
@@ -61,11 +69,16 @@ def _now():
 
 
 def init_db():
-    """建表；首次启动时写入种子目录（版本 1）。"""
+    """建表；首次启动时写入种子目录（版本 1）；对既有库执行增量升级。"""
     directory = os.path.dirname(os.path.abspath(db_path()))
     os.makedirs(directory, exist_ok=True)
     with session() as conn:
         conn.executescript(SCHEMA)
+        existing = {r["name"] for r in conn.execute("PRAGMA table_info(plans)").fetchall()}
+        for stmt in MIGRATIONS:
+            column = stmt.split("ADD COLUMN")[1].split()[0]
+            if column not in existing:
+                conn.execute(stmt)
         n = conn.execute("SELECT COUNT(*) AS n FROM catalog_versions").fetchone()["n"]
         if n == 0:
             from .seed_data import SEED_COURSES
@@ -121,6 +134,17 @@ def insert_plan(conn, plan_id, version_id, request, result):
         " VALUES (?,?,?,?,?,?)",
         (plan_id, version_id, json.dumps(request, ensure_ascii=False),
          json.dumps(result, ensure_ascii=False), "proposed", _now()),
+    )
+
+
+def insert_draft(conn, plan_id, version_id, request, result, source_plan_id, replan):
+    """滚动重排草案：关联原方案并保存重排上下文与差异，状态为 draft。"""
+    conn.execute(
+        "INSERT INTO plans (id, version_id, request_json, result_json, status, created_at,"
+        " source_plan_id, replan_json) VALUES (?,?,?,?,?,?,?,?)",
+        (plan_id, version_id, json.dumps(request, ensure_ascii=False),
+         json.dumps(result, ensure_ascii=False), "draft", _now(),
+         source_plan_id, json.dumps(replan, ensure_ascii=False)),
     )
 
 
